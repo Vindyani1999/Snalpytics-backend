@@ -2,7 +2,8 @@ from fastapi import FastAPI, Header, Body
 from pydantic import BaseModel
 from database import users, snapshots
 from ai_integration import format_data
-from firebase_auth import verify_token
+# from firebase_auth import verify_token
+from firebase_auth_vercel import verify_token
 from datetime import datetime
 
 app = FastAPI()
