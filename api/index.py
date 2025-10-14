@@ -1,81 +1,115 @@
-from fastapi import FastAPI, Header, Body
+from fastapi import FastAPI
 from pydantic import BaseModel
-import sys
 import os
-
-# Add the parent directory to the Python path to import modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from database import users, snapshots
-from ai_integration import format_data
-from firebase_auth_vercel import verify_token
+import csv
+import requests
 from datetime import datetime
 
+# Create FastAPI app
 app = FastAPI()
 
+# --- Data Model ---
 class ScrapeData(BaseModel):
-    url: str
-    fields: dict
-    timestamp: str
+    fields: list[str]       # Example: ["price", "name"]
+    rawContent: str         # The full grabbed webpage text
 
-# Save user OpenRouter API key
-@app.post("/save_api_key")
-def save_api_key(api_key: str = Body(...), authorization: str = Header(...)):
-    user_id = verify_token(authorization)
-    if not user_id:
-        return {"error": "Invalid token"}
 
-    users.update_one(
-        {"_id": user_id},
-        {"$set": {
-            "openrouter_key": api_key,
-            "usage": {"daily_limit": 100, "used_today": 0, "last_reset": str(datetime.today().date())}
-        }},
-        upsert=True
-    )
-    return {"status": "API key saved successfully"}
-
-# Receive scraped data
-@app.post("/scrape")
-def receive_scrape(data: ScrapeData, authorization: str = Header(...)):
-    user_id = verify_token(authorization)
-    if not user_id:
-        return {"error": "Invalid token"}
-
-    user = users.find_one({"_id": user_id})
-    if not user or "openrouter_key" not in user:
-        return {"error": "OpenRouter API key not set"}
-
-    # Reset usage if new day
-    today = str(datetime.today().date())
-    if user["usage"]["last_reset"] != today:
-        user["usage"]["used_today"] = 0
-        user["usage"]["last_reset"] = today
-
-    # Format data with user's OpenRouter key
-    formatted = format_data(data.fields, user["openrouter_key"])
-
-    # Update usage
-    users.update_one(
-        {"_id": user_id},
-        {"$inc": {"usage.used_today": 1}, "$set": {"usage.last_reset": today}}
+# --- DeepSeek Formatter ---
+def format_data_with_deepseek(data, api_key):
+    """Format scraped data using DeepSeek model via OpenRouter API"""
+    prompt = (
+        "You are an intelligent data extractor.\n"
+        "Given raw webpage text and a list of requested fields, "
+        "extract structured information in clean JSON format.\n\n"
+        f"### Requested Fields:\n{data['fields']}\n\n"
+        f"### Raw Content:\n{data['rawContent']}\n\n"
+        "Return only the relevant JSON output."
     )
 
-    # Save snapshot
-    snapshots.insert_one({
-        "user_id": user_id,
-        "url": data.url,
-        "fields": formatted,
-        "timestamp": datetime.fromisoformat(data.timestamp)
-    })
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek/deepseek-r1",
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=60
+        )
 
-    return {"status": "success", "formatted": formatted, "usage": user["usage"]}
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            return f"Error: {response.status_code} - {response.text}"
 
-# Fetch snapshots per user + URL
-@app.get("/category/{user_id}/{url}")
-def get_category_data(user_id: str, url: str):
-    results = list(snapshots.find({"user_id": user_id, "url": url}))
-    return {"url": url, "snapshots": results}
+    except Exception as e:
+        return f"Error formatting data: {str(e)}"
 
-# This is required for Vercel deployment
+
+# --- Save data locally (Vercel file system is ephemeral, but OK for logs) ---
+def save_to_csv(original_data, formatted_data, timestamp):
+    csv_filename = "/tmp/scraped_data.csv"  # Vercel allows writing only to /tmp
+    file_exists = os.path.isfile(csv_filename)
+
+    try:
+        with open(csv_filename, "a", newline="", encoding="utf-8") as csvfile:
+            fieldnames = ["timestamp", "original_data", "formatted_data"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow({
+                "timestamp": timestamp,
+                "original_data": str(original_data),
+                "formatted_data": formatted_data
+            })
+        return True
+    except Exception as e:
+        print(f"Error saving to CSV: {e}")
+        return False
+
+
+# --- Main Endpoint ---
+@app.post("/process")
+def process_scrape_data(data: ScrapeData):
+    api_key = os.getenv("OPENROUTER_KEY")
+    if not api_key:
+        return {"error": "OpenRouter API key not configured"}
+
+    try:
+        # Combine data for DeepSeek
+        combined_data = {"fields": data.fields, "rawContent": data.rawContent}
+
+        # Format via DeepSeek
+        formatted_data = format_data_with_deepseek(combined_data, api_key)
+
+        # Save result (optional)
+        timestamp = datetime.now().isoformat()
+        csv_saved = save_to_csv(combined_data, formatted_data, timestamp)
+
+        return {
+            "status": "success",
+            "fields_requested": data.fields,
+            "formatted_data": formatted_data,
+            "csv_saved": csv_saved,
+            "timestamp": timestamp
+        }
+
+    except Exception as e:
+        return {"error": f"Processing failed: {str(e)}"}
+
+
+# --- Health check ---
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "Snaplytics Data Processor"}
+
+
+# --- Required for Vercel ---
+# Expose handler for Vercel Python runtime
 handler = app
