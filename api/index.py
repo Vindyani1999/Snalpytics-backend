@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import os
 import csv
+import json
 import requests
 from datetime import datetime
 
@@ -10,21 +11,65 @@ app = FastAPI()
 
 # --- Data Model ---
 class ScrapeData(BaseModel):
+    # Fields the user cares about, will become CSV headers/columns
     fields: list[str]       # Example: ["price", "name"]
-    rawContent: str         # The full grabbed webpage text
+    # The full grabbed webpage text
+    rawContent: str
 
 
 # --- DeepSeek Formatter ---
-def format_data_with_deepseek(data, api_key):
-    """Format scraped data using DeepSeek model via OpenRouter API"""
-    prompt = (
-        "You are an intelligent data extractor.\n"
-        "Given raw webpage text and a list of requested fields, "
-        "extract structured information in clean JSON format.\n\n"
-        f"### Requested Fields:\n{data['fields']}\n\n"
-        f"### Raw Content:\n{data['rawContent']}\n\n"
-        "Return only the relevant JSON output."
+def _build_messages(fields: list[str], raw_content: str) -> list[dict]:
+    """Return chat messages enforcing strict JSON rows for requested headers."""
+    schema = {"rows": [{field: "string" for field in fields}]}
+
+    system = (
+        "You are an expert data extractor. Output must be STRICT JSON only. "
+        "No markdown, no explanations. Use exactly the requested headers as keys. "
+        "If a value is missing, use an empty string. If multiple items exist, return multiple objects in `rows`."
     )
+
+    user_payload = {
+        "headers": fields,
+        "text": raw_content,
+        "schema": schema,
+        "output_format": {"rows": [{h: "" for h in fields}]}
+    }
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user_payload)}
+    ]
+
+
+def _parse_model_json(text: str) -> list[dict]:
+    """Try to parse model output into a list of row dicts following { rows: [...] }."""
+    if not text:
+        return []
+
+    # Strip common code fences if present
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```", 1)[-1]
+    if cleaned.endswith("```"):
+        cleaned = cleaned.rsplit("```", 1)[0]
+    cleaned = cleaned.strip()
+
+    try:
+        payload = json.loads(cleaned)
+        if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+            # Ensure each row is a dict
+            return [r for r in payload["rows"] if isinstance(r, dict)]
+        # Sometimes the model might return a list directly
+        if isinstance(payload, list):
+            return [r for r in payload if isinstance(r, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str):
+    """Call DeepSeek via OpenRouter and return (rows, raw_text)."""
+    messages = _build_messages(fields, raw_content)
 
     try:
         response = requests.post(
@@ -35,43 +80,47 @@ def format_data_with_deepseek(data, api_key):
             },
             json={
                 "model": "deepseek/deepseek-r1",
-                "messages": [{"role": "user", "content": prompt}]
+                "messages": messages
             },
             timeout=60
         )
 
         if response.status_code == 200:
             result = response.json()
-            return result["choices"][0]["message"]["content"]
+            raw_text = result["choices"][0]["message"]["content"]
+            rows = _parse_model_json(raw_text)
+            return rows, raw_text
         else:
-            return f"Error: {response.status_code} - {response.text}"
+            return [], f"Error: {response.status_code} - {response.text}"
 
     except Exception as e:
-        return f"Error formatting data: {str(e)}"
+        return [], f"Error formatting data: {str(e)}"
 
 
 # --- Save data locally (Vercel file system is ephemeral, but OK for logs) ---
-def save_to_csv(original_data, formatted_data, timestamp):
-    csv_filename = "/tmp/scraped_data.csv"  # Vercel allows writing only to /tmp
+def save_rows_to_csv(headers: list[str], rows: list[dict], timestamp: str) -> str | None:
+    """Append rows to a CSV with given headers. Returns file path if saved, else None.
+    On Vercel, we must use /tmp for write access.
+    """
+    csv_filename = "/tmp/scraped_data.csv"
     file_exists = os.path.isfile(csv_filename)
 
     try:
         with open(csv_filename, "a", newline="", encoding="utf-8") as csvfile:
-            fieldnames = ["timestamp", "original_data", "formatted_data"]
+            # Prepend timestamp column
+            fieldnames = ["timestamp"] + headers
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
             if not file_exists:
                 writer.writeheader()
 
-            writer.writerow({
-                "timestamp": timestamp,
-                "original_data": str(original_data),
-                "formatted_data": formatted_data
-            })
-        return True
+            for row in rows:
+                safe_row = {h: row.get(h, "") for h in headers}
+                writer.writerow({"timestamp": timestamp, **safe_row})
+        return csv_filename
     except Exception as e:
         print(f"Error saving to CSV: {e}")
-        return False
+        return None
 
 
 # --- Main Endpoint ---
@@ -82,21 +131,20 @@ def process_scrape_data(data: ScrapeData):
         return {"error": "OpenRouter API key not configured"}
 
     try:
-        # Combine data for DeepSeek
-        combined_data = {"fields": data.fields, "rawContent": data.rawContent}
+        # Ask DeepSeek to extract strictly the requested fields
+        rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
 
-        # Format via DeepSeek
-        formatted_data = format_data_with_deepseek(combined_data, api_key)
-
-        # Save result (optional)
         timestamp = datetime.now().isoformat()
-        csv_saved = save_to_csv(combined_data, formatted_data, timestamp)
+        csv_path = None
+        if rows:
+            csv_path = save_rows_to_csv(data.fields, rows, timestamp)
 
         return {
-            "status": "success",
+            "status": "success" if rows else "no_rows",
             "fields_requested": data.fields,
-            "formatted_data": formatted_data,
-            "csv_saved": csv_saved,
+            "rows": rows,
+            "model_raw": raw_text,
+            "csv_path": csv_path,
             "timestamp": timestamp
         }
 
@@ -108,6 +156,11 @@ def process_scrape_data(data: ScrapeData):
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "Snaplytics Data Processor"}
+
+
+# --- Required for Vercel ---
+# Expose handler for Vercel Python runtime
+handler = app
 
 
 # --- Required for Vercel ---
