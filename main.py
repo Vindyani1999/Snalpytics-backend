@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from pymongo import MongoClient
 import os
 import json
 import requests
@@ -14,11 +13,19 @@ load_dotenv()
 # --- FastAPI app ---
 app = FastAPI()
 
-# --- MongoDB setup ---
+# --- MongoDB setup (optional, lazy import) ---
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-client = MongoClient(MONGO_URI)
-db = client["snaplytics_db"]
-collection = db["scraped_data"]
+client = None
+collection = None
+if MONGO_URI:
+    try:
+        from pymongo import MongoClient as _MongoClient
+        # short timeout to avoid long cold-start delays
+        client = _MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db = client["snaplytics_db"]
+        collection = db["scraped_data"]
+    except Exception as e:
+        print(f"Warning: could not connect to MongoDB or import pymongo: {e}")
 
 # --- Data model ---
 class ScrapeData(BaseModel):
