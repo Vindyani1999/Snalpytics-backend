@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from pymongo import MongoClient
 import os
 import json
 import requests
@@ -13,11 +12,21 @@ app = FastAPI()
 # Load .env for local development (Vercel uses dashboard env vars in production)
 load_dotenv()
 
-# --- MongoDB setup ---
+# --- MongoDB setup (optional, lazy import) ---
 MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
-db = client["snaplytics_db"]
-collection = db["scraped_data"]
+client = None
+collection = None
+if MONGO_URI:
+    try:
+        # import lazily so deployments that don't include pymongo won't fail at import time
+        from pymongo import MongoClient as _MongoClient
+        # short timeout to avoid long cold-start delays in serverless
+        client = _MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db = client["snaplytics_db"]
+        collection = db["scraped_data"]
+    except Exception as e:
+        # Don't crash the process; leave collection as None and log the error
+        print(f"Warning: could not connect to MongoDB or import pymongo: {e}")
 
 class ScrapeData(BaseModel):
     userId: str | None = None
@@ -83,7 +92,7 @@ def format_data_with_deepseek(fields, raw_content, api_key):
 def process_scrape_data(data: ScrapeData):
     api_key = os.getenv("OPENROUTER_KEY")
     if not api_key:
-        return {"error": "Missing OpenRouter API key"}
+        return {"status": "error", "message": "Missing OpenRouter API key"}
 
     user_id = data.userId or str(uuid.uuid4())
     rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
@@ -96,13 +105,22 @@ def process_scrape_data(data: ScrapeData):
         "model_raw": raw_text,
         "timestamp": timestamp
     }
-    collection.insert_one(doc)
+
+    db_status = "skipped"
+    if collection is not None:
+        try:
+            collection.insert_one(doc)
+            db_status = "saved"
+        except Exception as e:
+            # don't raise — return info so caller knows DB write failed
+            db_status = f"error: {str(e)}"
 
     return {
         "status": "success",
         "userId": user_id,
         "rows": rows,
-        "timestamp": timestamp
+        "timestamp": timestamp,
+        "db_status": db_status
     }
 
 
@@ -120,6 +138,14 @@ def get_user_data(userId: str):
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "Snaplytics (MongoDB Ready)"}
+
+
+@app.get("/env_check")
+def env_check():
+    """Return presence of critical env vars (true/false) for debugging in production.
+    DOES NOT return secret values."""
+    keys = ["OPENROUTER_KEY", "MONGO_URI"]
+    return {k: (os.getenv(k) is not None) for k in keys}
 
 
 # Required for Vercel
