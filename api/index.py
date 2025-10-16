@@ -1,168 +1,126 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from pymongo import MongoClient
 import os
-import csv
 import json
 import requests
 from datetime import datetime
+import uuid
+from dotenv import load_dotenv
 
-# Create FastAPI app
 app = FastAPI()
 
-# --- Data Model ---
+# Load .env for local development (Vercel uses dashboard env vars in production)
+load_dotenv()
+
+# --- MongoDB setup ---
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client["snaplytics_db"]
+collection = db["scraped_data"]
+
 class ScrapeData(BaseModel):
-    # Fields the user cares about, will become CSV headers/columns
-    fields: list[str]       # Example: ["price", "name"]
-    # The full grabbed webpage text
+    userId: str | None = None
+    fields: list[str]
     rawContent: str
 
 
-# --- DeepSeek Formatter ---
-def _build_messages(fields: list[str], raw_content: str) -> list[dict]:
-    """Return chat messages enforcing strict JSON rows for requested headers."""
+def _build_messages(fields, raw_content):
     schema = {"rows": [{field: "string" for field in fields}]}
-
     system = (
         "You are an expert data extractor. Output must be STRICT JSON only. "
         "No markdown, no explanations. Use exactly the requested headers as keys. "
-        "If a value is missing, use an empty string. If multiple items exist, return multiple objects in `rows`."
+        "If missing, leave blank. Return multiple `rows` if multiple items exist."
     )
-
     user_payload = {
         "headers": fields,
         "text": raw_content,
         "schema": schema,
         "output_format": {"rows": [{h: "" for h in fields}]}
     }
-
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(user_payload)}
     ]
 
 
-def _parse_model_json(text: str) -> list[dict]:
-    """Try to parse model output into a list of row dicts following { rows: [...] }."""
-    if not text:
-        return []
-
-    # Strip common code fences if present
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 1)[-1]
-    if cleaned.endswith("```"):
-        cleaned = cleaned.rsplit("```", 1)[0]
-    cleaned = cleaned.strip()
-
+def _parse_model_json(text):
     try:
+        cleaned = text.strip("`").strip()
         payload = json.loads(cleaned)
         if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
-            # Ensure each row is a dict
-            return [r for r in payload["rows"] if isinstance(r, dict)]
-        # Sometimes the model might return a list directly
+            return payload["rows"]
         if isinstance(payload, list):
-            return [r for r in payload if isinstance(r, dict)]
+            return payload
     except Exception:
-        pass
+        return []
     return []
 
 
-def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str):
-    """Call DeepSeek via OpenRouter and return (rows, raw_text)."""
+def format_data_with_deepseek(fields, raw_content, api_key):
     messages = _build_messages(fields, raw_content)
-
     try:
-        response = requests.post(
+        r = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": "deepseek/deepseek-r1",
-                "messages": messages
-            },
+            json={"model": "deepseek/deepseek-r1", "messages": messages},
             timeout=60
         )
-
-        if response.status_code == 200:
-            result = response.json()
-            raw_text = result["choices"][0]["message"]["content"]
-            rows = _parse_model_json(raw_text)
-            return rows, raw_text
-        else:
-            return [], f"Error: {response.status_code} - {response.text}"
-
+        if r.status_code == 200:
+            data = r.json()
+            content = data["choices"][0]["message"]["content"]
+            rows = _parse_model_json(content)
+            return rows, content
+        return [], f"Error: {r.status_code} - {r.text}"
     except Exception as e:
         return [], f"Error formatting data: {str(e)}"
 
 
-# --- Save data locally (Vercel file system is ephemeral, but OK for logs) ---
-def save_rows_to_csv(headers: list[str], rows: list[dict], timestamp: str) -> str | None:
-    """Append rows to a CSV with given headers. Returns file path if saved, else None.
-    On Vercel, we must use /tmp for write access.
-    """
-    csv_filename = "/tmp/scraped_data.csv"
-    file_exists = os.path.isfile(csv_filename)
-
-    try:
-        with open(csv_filename, "a", newline="", encoding="utf-8") as csvfile:
-            # Prepend timestamp column
-            fieldnames = ["timestamp"] + headers
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-            if not file_exists:
-                writer.writeheader()
-
-            for row in rows:
-                safe_row = {h: row.get(h, "") for h in headers}
-                writer.writerow({"timestamp": timestamp, **safe_row})
-        return csv_filename
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-        return None
-
-
-# --- Main Endpoint ---
 @app.post("/process")
 def process_scrape_data(data: ScrapeData):
     api_key = os.getenv("OPENROUTER_KEY")
     if not api_key:
-        return {"error": "OpenRouter API key not configured"}
+        return {"error": "Missing OpenRouter API key"}
 
-    try:
-        # Ask DeepSeek to extract strictly the requested fields
-        rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
+    user_id = data.userId or str(uuid.uuid4())
+    rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
+    timestamp = datetime.now().isoformat()
 
-        timestamp = datetime.now().isoformat()
-        csv_path = None
-        if rows:
-            csv_path = save_rows_to_csv(data.fields, rows, timestamp)
+    doc = {
+        "userId": user_id,
+        "fields_requested": data.fields,
+        "rows": rows,
+        "model_raw": raw_text,
+        "timestamp": timestamp
+    }
+    collection.insert_one(doc)
 
-        return {
-            "status": "success" if rows else "no_rows",
-            "fields_requested": data.fields,
-            "rows": rows,
-            "model_raw": raw_text,
-            "csv_path": csv_path,
-            "timestamp": timestamp
-        }
-
-    except Exception as e:
-        return {"error": f"Processing failed: {str(e)}"}
+    return {
+        "status": "success",
+        "userId": user_id,
+        "rows": rows,
+        "timestamp": timestamp
+    }
 
 
-# --- Health check ---
+@app.get("/get_user_data/{userId}")
+def get_user_data(userId: str):
+    docs = list(collection.find({"userId": userId}, {"_id": 0}))
+    return {
+        "status": "success" if docs else "no_data",
+        "userId": userId,
+        "records": docs,
+        "count": len(docs)
+    }
+
+
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "Snaplytics Data Processor"}
+    return {"status": "healthy", "service": "Snaplytics (MongoDB Ready)"}
 
 
-# --- Required for Vercel ---
-# Expose handler for Vercel Python runtime
-handler = app
-
-
-# --- Required for Vercel ---
-# Expose handler for Vercel Python runtime
+# Required for Vercel
 handler = app

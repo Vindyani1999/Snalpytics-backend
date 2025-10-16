@@ -1,28 +1,40 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from pymongo import MongoClient
 import os
-import csv
 import json
 import requests
 from datetime import datetime
+import uuid
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
+
+# --- FastAPI app ---
 app = FastAPI()
 
-# ✅ Data model matches your frontend payload
+# --- MongoDB setup ---
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+client = MongoClient(MONGO_URI)
+db = client["snaplytics_db"]
+collection = db["scraped_data"]
+
+# --- Data model ---
 class ScrapeData(BaseModel):
-    # Fields the user wants to extract
+    userId: str | None = None  # optional (will auto-generate)
     fields: list[str]
-    # Full page text content
     rawContent: str
 
 
-# ✅ Function to call DeepSeek via OpenRouter
+# --- DeepSeek Formatter ---
 def _build_messages(fields: list[str], raw_content: str) -> list[dict]:
     schema = {"rows": [{field: "string" for field in fields}]}
     system = (
         "You are an expert data extractor. Output must be STRICT JSON only. "
         "No markdown, no explanations. Use exactly the requested headers as keys. "
-        "If a value is missing, use an empty string. If multiple items exist, return multiple objects in `rows`."
+        "If a value is missing, use an empty string. "
+        "If multiple items exist, return multiple objects in `rows`."
     )
     user_payload = {
         "headers": fields,
@@ -57,9 +69,7 @@ def _parse_model_json(text: str) -> list[dict]:
 
 
 def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str):
-    """Call DeepSeek via OpenRouter and return (rows, raw_text)."""
     messages = _build_messages(fields, raw_content)
-
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -73,7 +83,6 @@ def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str)
             },
             timeout=60
         )
-
         if response.status_code == 200:
             result = response.json()
             raw_text = result["choices"][0]["message"]["content"]
@@ -81,31 +90,11 @@ def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str)
             return rows, raw_text
         else:
             return [], f"Error: {response.status_code} - {response.text}"
-
     except Exception as e:
         return [], f"Error formatting data: {str(e)}"
 
 
-# ✅ Save processed data to CSV
-def save_rows_to_csv(headers: list[str], rows: list[dict], timestamp: str) -> str | None:
-    csv_filename = "scraped_data.csv"
-    file_exists = os.path.isfile(csv_filename)
-    try:
-        with open(csv_filename, "a", newline="", encoding="utf-8") as csvfile:
-            fieldnames = ["timestamp"] + headers
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            for row in rows:
-                safe_row = {h: row.get(h, "") for h in headers}
-                writer.writerow({"timestamp": timestamp, **safe_row})
-        return csv_filename
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-        return None
-
-
-# ✅ Main API endpoint
+# --- Main Endpoint ---
 @app.post("/process")
 def process_scrape_data(data: ScrapeData):
     api_key = os.getenv("OPENROUTER_KEY")
@@ -113,28 +102,45 @@ def process_scrape_data(data: ScrapeData):
         return {"error": "OpenRouter API key not configured"}
 
     try:
-        # Ask DeepSeek to extract strictly the requested fields
+        user_id = data.userId or str(uuid.uuid4())
         rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
-
         timestamp = datetime.now().isoformat()
-        csv_path = None
-        if rows:
-            csv_path = save_rows_to_csv(data.fields, rows, timestamp)
 
-        return {
-            "status": "success" if rows else "no_rows",
+        # Save data to MongoDB
+        record = {
+            "userId": user_id,
             "fields_requested": data.fields,
             "rows": rows,
             "model_raw": raw_text,
-            "csv_path": csv_path,
+            "timestamp": timestamp
+        }
+        collection.insert_one(record)
+
+        return {
+            "status": "success" if rows else "no_rows",
+            "userId": user_id,
+            "fields_requested": data.fields,
+            "rows": rows,
             "timestamp": timestamp
         }
 
     except Exception as e:
-        return {"error": f"Processing failed: {str(e)}"}
+        return {"status": "error", "message": str(e)}
 
 
-# ✅ Health check endpoint
+# --- Get user data ---
+@app.get("/get_user_data/{userId}")
+def get_user_data(userId: str):
+    docs = list(collection.find({"userId": userId}, {"_id": 0}))
+    return {
+        "status": "success" if docs else "no_data",
+        "userId": userId,
+        "records": docs,
+        "count": len(docs)
+    }
+
+
+# --- Health check ---
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "Snaplytics Data Processor"}
+    return {"status": "healthy", "service": "Snaplytics Data Processor (MongoDB)"}
