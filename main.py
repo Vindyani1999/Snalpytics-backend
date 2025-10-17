@@ -1,14 +1,14 @@
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
 import json
 import requests
 from datetime import datetime
-import jwt
 import uuid
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
@@ -31,27 +31,15 @@ client = MongoClient(MONGO_URI)
 db = client["snaplytics_db"]
 collection = db["scraped_data"]
 
-JWT_SECRET = os.getenv("JWT_SECRET")  # must match Node.js backend secret
 
 # --- Data model ---
 class ScrapeData(BaseModel):
     fields: list[str]
     rawContent: str
+    userEmail: Optional[str] = None
 
 
-# --- Verify JWT token ---
-def verify_token(request: Request):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    token = auth_header.split(" ")[1]
-    try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return decoded
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+# JWT/token verification removed — writes use extension-supplied userEmail only.
 
 
 # --- DeepSeek formatter ---
@@ -113,14 +101,19 @@ def format_data_with_deepseek(fields: list[str], raw_content: str, api_key: str)
 
 # --- Protected endpoint ---
 @app.post("/process")
-def process_scrape_data(data: ScrapeData, user=Depends(verify_token)):
+def process_scrape_data(data: ScrapeData):
     api_key = os.getenv("OPENROUTER_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="OpenRouter API key missing")
 
     try:
-        user_id = user["id"]
-        user_email = user["email"]
+        # Require userEmail from the extension if no token flow is used.
+        if data.userEmail:
+            user_email = data.userEmail
+            user_id = None
+        else:
+            # No token flow in this local handler: reject if userEmail not provided
+            raise HTTPException(status_code=401, detail="Missing userEmail in payload")
 
         rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
         timestamp = datetime.now().isoformat()
@@ -147,13 +140,13 @@ def process_scrape_data(data: ScrapeData, user=Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/get_user_data")
-def get_user_data(user=Depends(verify_token)):
-    user_id = user["id"]
-    docs = list(collection.find({"userId": user_id}, {"_id": 0}))
+
+@app.get("/get_user_data_by_email/{email}")
+def get_user_data_by_email(email: str):
+    docs = list(collection.find({"userEmail": email}, {"_id": 0}))
     return {
         "status": "success" if docs else "no_data",
-        "user": {"id": user_id, "email": user["email"]},
+        "userEmail": email,
         "records": docs,
         "count": len(docs),
     }

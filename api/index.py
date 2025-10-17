@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
+from typing import Optional
 from pydantic import BaseModel
 import os
 import json
@@ -34,6 +35,7 @@ AUTH_VERIFY_URL = os.getenv("AUTH_VERIFY_URL")
 class ScrapeData(BaseModel):
     fields: list[str]
     rawContent: str
+    userEmail: Optional[str] = None
 
 
 def _build_messages(fields, raw_content):
@@ -91,41 +93,22 @@ def format_data_with_deepseek(fields, raw_content, api_key):
 
 # --- MAIN ENDPOINT ---
 @app.post("/process")
-def process_scrape_data(
-    data: ScrapeData,
-    authorization: Optional[str] = Header(None)
-):
+def process_scrape_data(data: ScrapeData):
     api_key = os.getenv("OPENROUTER_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing OpenRouter API key")
-
-    # 🔐 Verify Google login token via Node backend
-    user_info = None
-    if authorization:
-        try:
-            res = requests.get(
-                AUTH_VERIFY_URL,
-                headers={"Authorization": authorization},
-                timeout=10
-            )
-            if res.status_code == 200:
-                payload = res.json()
-                if payload.get("valid"):
-                    user_info = payload.get("user")
-        except Exception as e:
-            print("Token verification failed:", e)
-
-    if not user_info:
-        raise HTTPException(status_code=401, detail="Unauthorized or invalid token")
-
-    # ✅ Extract user ID or email
-    user_id = user_info.get("email") or user_info.get("id") or str(uuid.uuid4())
+    # Require userEmail from the extension payload (no JWT required for writes).
+    if data.userEmail:
+        user_email = data.userEmail
+        user_id = None
+    else:
+        raise HTTPException(status_code=401, detail="Missing userEmail in payload")
 
     rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
     timestamp = datetime.now().isoformat()
 
     doc = {
-        "userId": user_id,
+        "userEmail": user_email,
         "fields_requested": data.fields,
         "rows": rows,
         "model_raw": raw_text,
@@ -142,7 +125,7 @@ def process_scrape_data(
 
     return {
         "status": "success",
-        "userId": user_id,
+        "userEmail": user_email,
         "rows": rows,
         "timestamp": timestamp,
         "db_status": db_status
@@ -192,6 +175,19 @@ def get_user_data(userId: str):
     return {
         "status": "success" if docs else "no_data",
         "userId": userId,
+        "records": docs,
+        "count": len(docs)
+    }
+
+
+@app.get("/get_user_data_by_email/{email}")
+def get_user_data_by_email(email: str):
+    if collection is None:
+        return {"status": "error", "message": "DB not configured"}
+    docs = list(collection.find({"userEmail": email}, {"_id": 0}))
+    return {
+        "status": "success" if docs else "no_data",
+        "userEmail": email,
         "records": docs,
         "count": len(docs)
     }
