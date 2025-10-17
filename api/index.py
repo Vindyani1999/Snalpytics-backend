@@ -28,8 +28,10 @@ if MONGO_URI:
         # Don't crash the process; leave collection as None and log the error
         print(f"Warning: could not connect to MongoDB or import pymongo: {e}")
 
+# --- Auth Verify URL (Node.js backend endpoint) ---
+AUTH_VERIFY_URL = os.getenv("AUTH_VERIFY_URL")
+
 class ScrapeData(BaseModel):
-    userId: str | None = None
     fields: list[str]
     rawContent: str
 
@@ -87,14 +89,38 @@ def format_data_with_deepseek(fields, raw_content, api_key):
     except Exception as e:
         return [], f"Error formatting data: {str(e)}"
 
-
+# --- MAIN ENDPOINT ---
 @app.post("/process")
-def process_scrape_data(data: ScrapeData):
+def process_scrape_data(
+    data: ScrapeData,
+    authorization: Optional[str] = Header(None)
+):
     api_key = os.getenv("OPENROUTER_KEY")
     if not api_key:
-        return {"status": "error", "message": "Missing OpenRouter API key"}
+        raise HTTPException(status_code=500, detail="Missing OpenRouter API key")
 
-    user_id = data.userId or str(uuid.uuid4())
+    # 🔐 Verify Google login token via Node backend
+    user_info = None
+    if authorization:
+        try:
+            res = requests.get(
+                AUTH_VERIFY_URL,
+                headers={"Authorization": authorization},
+                timeout=10
+            )
+            if res.status_code == 200:
+                payload = res.json()
+                if payload.get("valid"):
+                    user_info = payload.get("user")
+        except Exception as e:
+            print("Token verification failed:", e)
+
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Unauthorized or invalid token")
+
+    # ✅ Extract user ID or email
+    user_id = user_info.get("email") or user_info.get("id") or str(uuid.uuid4())
+
     rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
     timestamp = datetime.now().isoformat()
 
@@ -112,7 +138,6 @@ def process_scrape_data(data: ScrapeData):
             collection.insert_one(doc)
             db_status = "saved"
         except Exception as e:
-            # don't raise — return info so caller knows DB write failed
             db_status = f"error: {str(e)}"
 
     return {
@@ -123,9 +148,46 @@ def process_scrape_data(data: ScrapeData):
         "db_status": db_status
     }
 
+# @app.post("/process")
+# def process_scrape_data(data: ScrapeData):
+#     api_key = os.getenv("OPENROUTER_KEY")
+#     if not api_key:
+#         return {"status": "error", "message": "Missing OpenRouter API key"}
 
+#     user_id = data.userId or str(uuid.uuid4())
+#     rows, raw_text = format_data_with_deepseek(data.fields, data.rawContent, api_key)
+#     timestamp = datetime.now().isoformat()
+
+#     doc = {
+#         "userId": user_id,
+#         "fields_requested": data.fields,
+#         "rows": rows,
+#         "model_raw": raw_text,
+#         "timestamp": timestamp
+#     }
+
+#     db_status = "skipped"
+#     if collection is not None:
+#         try:
+#             collection.insert_one(doc)
+#             db_status = "saved"
+#         except Exception as e:
+#             # don't raise — return info so caller knows DB write failed
+#             db_status = f"error: {str(e)}"
+
+#     return {
+#         "status": "success",
+#         "userId": user_id,
+#         "rows": rows,
+#         "timestamp": timestamp,
+#         "db_status": db_status
+#     }
+
+# --- FETCH USER DATA ---
 @app.get("/get_user_data/{userId}")
 def get_user_data(userId: str):
+    if collection is None:
+        return {"status": "error", "message": "DB not configured"}
     docs = list(collection.find({"userId": userId}, {"_id": 0}))
     return {
         "status": "success" if docs else "no_data",
@@ -134,18 +196,10 @@ def get_user_data(userId: str):
         "count": len(docs)
     }
 
-
+# --- Health Check ---
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "service": "Snaplytics (MongoDB Ready)"}
-
-
-@app.get("/env_check")
-def env_check():
-    """Return presence of critical env vars (true/false) for debugging in production.
-    DOES NOT return secret values."""
-    keys = ["OPENROUTER_KEY", "MONGO_URI"]
-    return {k: (os.getenv(k) is not None) for k in keys}
 
 
 # Required for Vercel
