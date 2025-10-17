@@ -185,11 +185,60 @@ def get_user_data_by_email(email: str):
     if collection is None:
         return {"status": "error", "message": "DB not configured"}
     docs = list(collection.find({"userEmail": email}, {"_id": 0}))
+
+    def _try_parse_model_raw(model_raw: str):
+        if not model_raw or not isinstance(model_raw, str):
+            return []
+        s = model_raw.strip()
+        # remove common fenced code blocks
+        if s.startswith("```") and s.endswith("```"):
+            s = s.strip("`")
+        # try direct load
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        # try to locate the first JSON object/array in the string
+        start = None
+        end = None
+        for i, ch in enumerate(s):
+            if ch in ('{', '['):
+                start = i
+                break
+        for i in range(len(s) - 1, -1, -1):
+            if s[i] in ('}', ']'):
+                end = i + 1
+                break
+        if start is not None and end is not None and end > start:
+            snippet = s[start:end]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return []
+        return []
+
+    normalized = []
+    for d in docs:
+        rows = d.get("rows") or []
+        parsed_rows = rows
+        if (not rows or len(rows) == 0) and d.get("model_raw"):
+            parsed = _try_parse_model_raw(d.get("model_raw"))
+            # model_raw might contain an object with {"rows": [...]}
+            if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+                parsed_rows = parsed.get("rows")
+            elif isinstance(parsed, list):
+                parsed_rows = parsed
+        # include both original model_raw and parsed rows for frontend convenience
+        normalized.append({
+            **{k: v for k, v in d.items()},
+            "parsed_rows": parsed_rows,
+        })
+
     return {
-        "status": "success" if docs else "no_data",
+        "status": "success" if normalized else "no_data",
         "userEmail": email,
-        "records": docs,
-        "count": len(docs)
+        "records": normalized,
+        "count": len(normalized)
     }
 
 # --- Health Check ---
